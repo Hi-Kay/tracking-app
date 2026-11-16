@@ -1,0 +1,26 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <title>Tracker</title>
+  <meta name="theme-color" content="#f6f5f2" media="(prefers-color-scheme: light)">
+  <meta name="theme-color" content="#151412" media="(prefers-color-scheme: dark)">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <link rel="manifest" href="manifest.webmanifest">
+  <link rel="icon" href="icon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <header class="top">
+    <h1>Tracker</h1>
+    <nav class="tabs" role="tablist">
+      <button data-act="tab" data-tab="week" role="tab">This week</button>
+      <button data-act="tab" data-tab="plan" role="tab">Plan</button>
+    </nav>
+  </header>
+  <main id="view"></main>
+  <dialog id="editor"></dialog>
+  <script src="app.js"></script>
+</body>
+</html>

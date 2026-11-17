@@ -1,15 +1,18 @@
-/* Tracker — areas with long-term phases, logged week by week.
+/* Tracker — areas with long-term phases and activity types, logged day by day.
    All data lives in localStorage (see KEY). No backend. */
 
 const KEY = 'tracker.v1';
 const COLORS = ['#d13a3f', '#d9600f', '#26875a', '#1f7ae0', '#7d45b8', '#0f8a8a'];
+const TYPE_COLORS = ['#3fae5a', '#22b3c4', '#e08a2b', '#d9485f', '#7d5bd0', '#2f7de1', '#b59a1f', '#8a6d5a'];
 const DAY_LETTERS = ['M', 'T', 'W', 'T', 'F', 'S', 'S'];
+const DAY_SHORT = ['Mo', 'Tu', 'We', 'Th', 'Fr', 'Sa', 'Su'];
 
 // ---------- helpers ----------
 const $ = (s) => document.querySelector(s);
 const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => (
   { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 const uid = () => Math.random().toString(36).slice(2, 10);
+const safeColor = (c, fallback) => (/^#[0-9a-f]{6}$/i.test(c) ? c : fallback);
 const parse = (s) => { const [y, m, d] = s.split('-').map(Number); return new Date(y, m - 1, d); };
 const iso = (d) => `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
 const addDays = (d, n) => new Date(d.getFullYear(), d.getMonth(), d.getDate() + n);
@@ -24,19 +27,77 @@ function isoWeek(d) {
   return Math.ceil(((t - Date.UTC(t.getUTCFullYear(), 0, 1)) / 864e5 + 1) / 7);
 }
 
+// ---------- templates ----------
+const TEMPLATES = {
+  sport: {
+    name: 'Sport', icon: '🏋️', color: COLORS[0],
+    types: [['Strength', 'S', '#3fae5a'], ['Cardio', 'C', '#22b3c4'], ['Running', 'R', '#e08a2b'], ['Norwegian 4×4', '4×4', '#d9485f']],
+    phases: [
+      ['Build the routine', 4, 3, 'Show up 3× a week. Light weights, clean technique — find out which exercises you will do.'],
+      ['Increase weight', 4, 3, 'Add weight in small steps each week on the main lifts.'],
+      ['Deload', 1, 2, 'Lighter week: reduce weight and let the body recover.'],
+      ['Push further', 4, 4, 'Add a fourth session and keep progressing.'],
+    ],
+  },
+  japanese: {
+    name: 'Japanese', icon: '🇯🇵', color: COLORS[3],
+    types: [['Kana', 'か', '#d9485f'], ['Kanji', '漢', '#7d5bd0'], ['Vocabulary', 'V', '#2f7de1'], ['Grammar', 'G', '#3fae5a']],
+    phases: [
+      ['Daily habit', 4, 5, '15 minutes a day. Short sessions, never skip twice.'],
+      ['Vocabulary & grammar', 6, 5, 'New words every session, one grammar point per week.'],
+      ['Reading & listening', 6, 5, 'Short texts and audio at your level; keep reviews going.'],
+      ['Review & consolidate', 2, 4, 'No new material. Repeat weak spots.'],
+    ],
+  },
+  blank: { name: '', icon: '🎯', color: COLORS[2], types: [['Session', '✓', '#2f7de1']], phases: [['Phase 1', 4, 3, '']] },
+};
+const makeTypes = (list) => list.map(([name, short, color]) => ({ id: uid(), name, short, color }));
+function fromTemplate(key) {
+  const t = TEMPLATES[key];
+  return {
+    id: uid(), name: t.name, icon: t.icon, color: t.color, start: iso(monday(today())),
+    types: makeTypes(t.types),
+    phases: t.phases.map(([name, weeks, target, focus]) => ({ id: uid(), name, weeks, target, focus })),
+    log: {}, notes: {},
+  };
+}
+
 // ---------- state ----------
+/** Bring any stored/imported data to the current shape (v2: log values are arrays of type ids). */
+function normalize(s) {
+  for (const a of s.areas) {
+    a.log ??= {};
+    a.notes ??= {};
+    a.phases ??= [];
+    a.color = safeColor(a.color, COLORS[0]);
+    if (!Array.isArray(a.types) || !a.types.length) {
+      // v1 areas had no types: borrow the matching template's, else a generic one
+      const tpl = Object.values(TEMPLATES).find((t) => t.name && t.name.toLowerCase() === String(a.name).toLowerCase());
+      a.types = makeTypes((tpl || TEMPLATES.blank).types);
+    }
+    a.types.forEach((t, i) => { t.color = safeColor(t.color, TYPE_COLORS[i % TYPE_COLORS.length]); });
+    const ids = a.types.map((t) => t.id);
+    for (const [d, v] of Object.entries(a.log)) {
+      const arr = Array.isArray(v) ? ids.filter((id) => v.includes(id)) : v ? [ids[0]] : [];
+      if (arr.length) a.log[d] = arr; else delete a.log[d];
+    }
+  }
+  s.version = 2;
+  return s;
+}
 function load() {
   try {
     const s = JSON.parse(localStorage.getItem(KEY));
-    if (s && Array.isArray(s.areas)) return s;
+    if (s && Array.isArray(s.areas)) return normalize(s);
   } catch { /* fall through to empty state */ }
-  return { version: 1, areas: [] };
+  return { version: 2, areas: [] };
 }
 function save() { localStorage.setItem(KEY, JSON.stringify(state)); }
 
 let state = load();
-const ui = { tab: 'week', weekOffset: 0 };
-let draft = null; // area being edited in the dialog
+const ui = { tab: 'week', weekOffset: 0, overviewArea: null, scrollToCurrent: false };
+let draft = null; // area being edited
+let pick = null;  // { id, date } for the day picker
 
 // ---------- plan maths ----------
 const totalWeeks = (a) => a.phases.reduce((n, p) => n + p.weeks, 0);
@@ -60,40 +121,55 @@ function position(a, date) {
   }
   return { status: 'done', total, weeksAgo: w - total + 1 };
 }
+const typesOn = (a, date) => (a.log[date] || []).map((id) => a.types.find((t) => t.id === id)).filter(Boolean);
 const countWeek = (a, mon) => {
   let n = 0;
   for (let i = 0; i < 7; i++) if (a.log[iso(addDays(mon, i))]) n++;
   return n;
 };
 
-// ---------- templates ----------
-const TEMPLATES = {
-  sport: {
-    name: 'Sport', icon: '🏋️', color: COLORS[0], phases: [
-      ['Build the routine', 4, 3, 'Show up 3× a week. Light weights, clean technique — consistency beats intensity.'],
-      ['Increase weight', 4, 3, 'Add weight in small steps each week on the main lifts.'],
-      ['Deload', 1, 2, 'Lighter week: reduce weight and let the body recover.'],
-      ['Push further', 4, 4, 'Add a fourth session and keep progressing.'],
-    ],
-  },
-  japanese: {
-    name: 'Japanese', icon: '🇯🇵', color: COLORS[3], phases: [
-      ['Daily habit', 4, 5, '15 minutes a day. Short sessions, never skip twice.'],
-      ['Vocabulary & grammar', 6, 5, 'New words every session, one grammar point per week.'],
-      ['Reading & listening', 6, 5, 'Short texts and audio at your level; keep reviews going.'],
-      ['Review & consolidate', 2, 4, 'No new material. Repeat weak spots.'],
-    ],
-  },
-  blank: { name: '', icon: '🎯', color: COLORS[2], phases: [['Phase 1', 4, 3, '']] },
-};
-function fromTemplate(key) {
-  const t = TEMPLATES[key];
-  return {
-    id: uid(), name: t.name, icon: t.icon, color: t.color, start: iso(monday(today())),
-    phases: t.phases.map(([name, weeks, target, focus]) => ({ id: uid(), name, weeks, target, focus })),
-    log: {}, notes: {},
+/** Weeks in a row the target was met. This week counts once it is met; an unfinished week does not break it. */
+function streak(a) {
+  const thisMon = monday(today());
+  const weekState = (m) => {
+    const p = position(a, m);
+    if (p.status !== 'active') return 'stop';
+    if (!p.phase.target) return 'skip'; // rest weeks neither count nor break
+    return countWeek(a, m) >= p.phase.target ? 'met' : 'miss';
   };
+  let n = 0;
+  for (let m = addDays(thisMon, -7); ; m = addDays(m, -7)) {
+    const s = weekState(m);
+    if (s === 'met') n++; else if (s !== 'skip') break;
+  }
+  if (weekState(thisMon) === 'met') n++;
+  return n;
 }
+
+function toggleType(a, date, typeId) {
+  const cur = a.log[date] || [];
+  const next = cur.includes(typeId) ? cur.filter((x) => x !== typeId) : [...cur, typeId];
+  const ordered = a.types.map((t) => t.id).filter((id) => next.includes(id));
+  if (ordered.length) a.log[date] = ordered; else delete a.log[date];
+  save();
+}
+
+// ---------- shared bits ----------
+const tint = (c, pct = 50) => `color-mix(in oklab, ${c} ${pct}%, var(--surface))`;
+function fill(ts) {
+  if (!ts.length) return '';
+  const step = 100 / ts.length;
+  return `background:linear-gradient(90deg, ${ts.map((t, i) => `${tint(t.color)} ${i * step}% ${(i + 1) * step}%`).join(', ')})`;
+}
+function dayBtn(a, d, inner) {
+  const key = iso(d), t = today(), ts = typesOn(a, key);
+  const label = fmt(d, { weekday: 'long', day: 'numeric', month: 'long' }) + (ts.length ? `: ${ts.map((x) => x.name).join(', ')}` : '');
+  return `<button class="day ${ts.length ? 'on' : ''} ${+d === +t ? 'today' : ''}" style="${fill(ts)}"
+    data-act="toggle" data-id="${a.id}" data-date="${key}" ${d > t ? 'disabled' : ''} aria-label="${esc(label)}">
+    ${inner}<em>${ts.map((x) => esc(x.short)).join(' ')}</em></button>`;
+}
+const typeChip = (t, extra = '') => `<span class="tchip" style="--t:${t.color}"><b>${esc(t.short)}</b>${extra}</span>`;
+const streakTag = (a) => { const s = streak(a); return s ? `<span class="streak">🔥 ${plural(s, 'week')} in a row</span>` : ''; };
 
 // ---------- rendering: week ----------
 function renderWeek() {
@@ -131,21 +207,19 @@ function emptyState() {
 }
 
 function planBar(a, pos) {
-  const total = pos.total;
-  if (!total) return '';
+  if (!pos.total) return '';
   const segs = a.phases.map((p, i) => {
     const cls = pos.status === 'done' || (pos.status === 'active' && i < pos.phaseIndex) ? 'past'
       : pos.status === 'active' && i === pos.phaseIndex ? 'now' : 'future';
     return `<div class="seg ${cls}" style="flex:${p.weeks}" title="${esc(p.name)} · ${plural(p.weeks, 'week')}"><span>${esc(p.name)}</span></div>`;
   }).join('');
   const marker = pos.status === 'active'
-    ? `<div class="marker" style="left:${((pos.week - 0.5) / total) * 100}%"></div>` : '';
+    ? `<div class="marker" style="left:${((pos.week - 0.5) / pos.total) * 100}%"></div>` : '';
   return `<div class="planbar">${segs}${marker}</div>`;
 }
 
 function weekCard(a, mon) {
   const pos = position(a, mon);
-  const t = today();
   const count = countWeek(a, mon);
   const target = pos.phase?.target ?? 0;
   const met = target > 0 && count >= target;
@@ -175,12 +249,16 @@ function weekCard(a, mon) {
 
   const days = DAY_LETTERS.map((l, i) => {
     const d = addDays(mon, i);
-    const key = iso(d);
-    const cls = [a.log[key] ? 'on' : '', +d === +t ? 'today' : ''].join(' ');
-    return `<button class="day ${cls}" data-act="toggle" data-id="${a.id}" data-date="${key}" ${d > t ? 'disabled' : ''}
-      aria-pressed="${!!a.log[key]}" aria-label="${fmt(d, { weekday: 'long', day: 'numeric', month: 'long' })}">
-      <small>${l}</small><b>${d.getDate()}</b></button>`;
+    return dayBtn(a, d, `<small>${l}</small><b>${d.getDate()}</b>`);
   }).join('');
+
+  // per-type breakdown, only meaningful with more than one type
+  let breakdown = '';
+  if (a.types.length > 1) {
+    const by = {};
+    for (let i = 0; i < 7; i++) typesOn(a, iso(addDays(mon, i))).forEach((t) => { by[t.id] = (by[t.id] || 0) + 1; });
+    breakdown = a.types.filter((t) => by[t.id]).map((t) => typeChip(t, ` ${by[t.id]}`)).join('');
+  }
 
   return `
     <article class="card area" style="--c:${a.color}">
@@ -191,12 +269,66 @@ function weekCard(a, mon) {
       </header>
       ${body}
       <div class="days">${days}</div>
-      <div class="tally ${met ? 'met' : ''}">
-        ${target ? `${count} / ${target} sessions${met ? ' ✓' : ''}` : plural(count, 'session')}
+      <div class="tally">
+        <span class="${met ? 'met' : ''}">${target ? `${count} / ${target} sessions${met ? ' ✓' : ''}` : plural(count, 'session')}</span>
+        ${breakdown}
+        ${ui.weekOffset === 0 ? streakTag(a) : ''}
       </div>
       <input class="note" data-note="${a.id}" data-week="${iso(mon)}" placeholder="Note for this week…"
         value="${esc(a.notes?.[iso(mon)] ?? '')}">
     </article>`;
+}
+
+// ---------- rendering: overview (multi-week grid) ----------
+function renderOverview() {
+  if (!state.areas.length) return emptyState();
+  const a = state.areas.find((x) => x.id === ui.overviewArea) || state.areas[0];
+  const pills = state.areas.length > 1
+    ? `<div class="area-pick">${state.areas.map((x) => `<button class="pill ${x === a ? 'on' : ''}" style="--c:${x.color}" data-act="ov" data-id="${x.id}">${esc(x.icon)} ${esc(x.name)}</button>`).join('')}</div>`
+    : '';
+
+  const start = planStart(a), total = totalWeeks(a), thisMon = monday(today());
+  const n = Math.max(total, weeksBetween(start, thisMon) + 1);
+  let rows = '', acc = 0;
+  for (let w = 0; w < n; w++) {
+    const mon = addDays(start, w * 7);
+    const pos = position(a, mon);
+    if (pos.status === 'active' && pos.phaseWeek === 1) {
+      const p = pos.phase;
+      rows += `<tr class="phase-row"><td colspan="9">
+        <b>${esc(p.name)}</b> <span class="muted">· weeks ${acc + 1}–${acc + p.weeks} · ${p.target}×/week</span>
+        ${p.focus ? `<div>${esc(p.focus)}</div>` : ''}</td></tr>`;
+      acc += p.weeks;
+    }
+    if (w === total && total) rows += '<tr class="phase-row"><td colspan="9"><b>After the plan</b></td></tr>';
+
+    const isCur = +mon === +thisMon, future = mon > thisMon;
+    const count = countWeek(a, mon), target = pos.phase?.target ?? 0;
+    const cells = DAY_SHORT.map((_, i) => `<td>${dayBtn(a, addDays(mon, i), '')}</td>`).join('');
+    const cnt = future ? '' : target ? `${count}/${target}` : (count || '');
+    rows += `
+      <tr class="${isCur ? 'cur' : ''} ${future ? 'future' : ''}" ${isCur ? 'id="cur-week"' : ''}>
+        <th scope="row"><button class="wk" data-act="goweek" data-mon="${iso(mon)}" title="Open this week">${w + 1}<small>${fmt(mon)}</small></button></th>
+        ${cells}
+        <td class="cnt ${target && count >= target ? 'met' : ''}">${cnt}</td>
+      </tr>`;
+    const note = a.notes?.[iso(mon)];
+    if (note) rows += `<tr class="note-row"><td></td><td colspan="8">${esc(note)}</td></tr>`;
+  }
+
+  return `
+    ${pills}
+    <section class="card grid-card" style="--c:${a.color}">
+      <header class="area-head">
+        <h2><span class="emoji">${esc(a.icon)}</span>${esc(a.name)}</h2>
+        ${streakTag(a)}
+      </header>
+      <div class="legend-types">${a.types.map((t) => typeChip(t, ` ${esc(t.name)}`)).join('')}</div>
+      <table class="grid">
+        <thead><tr><th class="wk-h">Wk</th>${DAY_SHORT.map((d) => `<th>${d}</th>`).join('')}<th class="cnt-h">✓</th></tr></thead>
+        <tbody>${rows}</tbody>
+      </table>
+    </section>`;
 }
 
 // ---------- rendering: plan ----------
@@ -300,10 +432,52 @@ function planList(a) {
 
 function render() {
   document.querySelectorAll('.tabs button').forEach((b) => b.setAttribute('aria-selected', b.dataset.tab === ui.tab));
-  $('#view').innerHTML = ui.tab === 'week' ? renderWeek() : renderPlan();
+  $('#view').innerHTML = ui.tab === 'week' ? renderWeek() : ui.tab === 'overview' ? renderOverview() : renderPlan();
   const road = $('#road');
   if (road) road.scrollLeft = Math.max(0, (road.dataset.today - 2) * COL);
+  if (ui.scrollToCurrent) {
+    ui.scrollToCurrent = false;
+    document.getElementById('cur-week')?.scrollIntoView({ block: 'center' });
+  }
 }
+
+// ---------- day picker ----------
+function openPicker(a, date) {
+  pick = { id: a.id, date };
+  renderPicker();
+  $('#picker').showModal();
+}
+function renderPicker() {
+  const a = state.areas.find((x) => x.id === pick.id);
+  const on = a.log[pick.date] || [];
+  $('#picker').innerHTML = `
+    <form method="dialog">
+      <h2>${fmt(parse(pick.date), { weekday: 'long', day: 'numeric', month: 'long' })}</h2>
+      <p class="muted">${esc(a.icon)} ${esc(a.name)} · what did you do?</p>
+      <div class="types">
+        ${a.types.map((t) => `
+          <button type="button" class="type-tog ${on.includes(t.id) ? 'on' : ''}" style="--t:${t.color}"
+            data-pact="t" data-t="${t.id}" aria-pressed="${on.includes(t.id)}">
+            <b>${esc(t.short)}</b><span>${esc(t.name)}</span><span class="check">${on.includes(t.id) ? '✓' : ''}</span>
+          </button>`).join('')}
+      </div>
+      <footer class="row">
+        <button type="button" class="btn ghost" data-pact="clear" ${on.length ? '' : 'disabled'}>Clear day</button>
+        <span class="grow"></span>
+        <button class="btn">Done</button>
+      </footer>
+    </form>`;
+}
+$('#picker').addEventListener('click', (e) => {
+  if (e.target === e.currentTarget) { e.currentTarget.close(); return; } // backdrop
+  const b = e.target.closest('[data-pact]');
+  if (!b) return;
+  const a = state.areas.find((x) => x.id === pick.id);
+  if (b.dataset.pact === 't') toggleType(a, pick.date, b.dataset.t);
+  else { delete a.log[pick.date]; save(); }
+  renderPicker();
+  render();
+});
 
 // ---------- editor ----------
 function openEditor(area, isNew) {
@@ -315,6 +489,14 @@ function openEditor(area, isNew) {
 
 function renderEditor() {
   const d = draft;
+  const types = d.types.map((t, i) => `
+    <div class="row trow">
+      <input type="color" data-tf="color" data-i="${i}" value="${t.color}" aria-label="Colour">
+      <input class="t-short" data-tf="short" data-i="${i}" value="${esc(t.short)}" maxlength="4" placeholder="S" required aria-label="Short label">
+      <input class="t-name" data-tf="name" data-i="${i}" value="${esc(t.name)}" placeholder="e.g. Strength" required aria-label="Name">
+      <button type="button" class="icon-btn small" data-eact="tdel" data-i="${i}" ${d.types.length === 1 ? 'disabled' : ''} aria-label="Remove type">✕</button>
+    </div>`).join('');
+
   const phases = d.phases.map((p, i) => `
     <fieldset class="ph">
       <div class="row">
@@ -349,6 +531,10 @@ function renderEditor() {
         </div>
       </div>
       <p class="hint muted">Weeks run Monday–Sunday. Week 1 is the week containing the start date.</p>
+      <h3>Activity types</h3>
+      <p class="hint muted">What you can log on a day — e.g. Strength (S) and Cardio (C). A day can have several.</p>
+      ${types}
+      <button type="button" class="btn ghost small" data-eact="tadd">+ Add type</button>
       <h3>Phases <span class="muted">· ${plural(totalWeeks(d), 'week')} in total</span></h3>
       ${phases}
       <button type="button" class="btn ghost" data-eact="add">+ Add phase</button>
@@ -362,10 +548,10 @@ function renderEditor() {
 }
 
 $('#editor').addEventListener('input', (e) => {
-  const { f, i } = e.target.dataset;
+  const { f, tf, i } = e.target.dataset;
+  if (tf) { draft.types[i][tf] = e.target.value; return; }
   if (!f) return;
-  const isNum = e.target.type === 'number';
-  const v = isNum ? Number(e.target.value) : e.target.value;
+  const v = e.target.type === 'number' ? Number(e.target.value) : e.target.value;
   if (i !== undefined) draft.phases[i][f] = v; else draft[f] = v;
 });
 
@@ -381,6 +567,18 @@ $('#editor').addEventListener('click', (e) => {
     case 'down': [ph[i + 1], ph[i]] = [ph[i], ph[i + 1]]; break;
     case 'color': draft.color = b.dataset.c; break;
     case 'tpl': draft = { ...fromTemplate(b.dataset.t), isNew: true }; break;
+    case 'tadd':
+      draft.types.push({ id: uid(), name: '', short: '', color: TYPE_COLORS[draft.types.length % TYPE_COLORS.length] });
+      renderEditor();
+      [...document.querySelectorAll('#editor .t-short')].at(-1).focus();
+      return;
+    case 'tdel': {
+      const t = draft.types[i];
+      const used = Object.values(draft.log).filter((v) => v.includes(t.id)).length;
+      if (used && !confirm(`"${t.name || t.short}" is logged on ${plural(used, 'day')}. Remove it from those days too?`)) return;
+      draft.types.splice(i, 1);
+      break;
+    }
     case 'cancel': $('#editor').close(); return;
     case 'remove':
       if (!confirm(`Delete "${draft.name}" including everything logged for it?`)) return;
@@ -395,10 +593,12 @@ $('#editor').addEventListener('submit', (e) => {
   const { isNew, ...area } = draft;
   area.name = area.name.trim();
   area.icon = area.icon.trim() || '🎯';
+  area.types.forEach((t) => { t.name = t.name.trim(); t.short = t.short.trim(); });
   area.phases.forEach((p) => {
     p.weeks = Math.max(1, Math.round(p.weeks) || 1);
     p.target = Math.min(7, Math.max(0, Math.round(p.target) || 0));
   });
+  normalize({ areas: [area] }); // drops log entries of removed types
   if (isNew) state.areas.push(area);
   else state.areas = state.areas.map((a) => (a.id === area.id ? area : a));
   save(); $('#editor').close(); render();
@@ -410,11 +610,21 @@ document.addEventListener('click', (e) => {
   if (!b) return;
   const area = state.areas.find((a) => a.id === b.dataset.id);
   switch (b.dataset.act) {
-    case 'tab': ui.tab = b.dataset.tab; break;
+    case 'tab':
+      ui.tab = b.dataset.tab;
+      ui.scrollToCurrent = ui.tab === 'overview';
+      break;
     case 'week': ui.weekOffset = b.dataset.d === '0' ? 0 : ui.weekOffset + Number(b.dataset.d); break;
+    case 'goweek':
+      ui.tab = 'week';
+      ui.weekOffset = weeksBetween(monday(today()), parse(b.dataset.mon));
+      window.scrollTo(0, 0);
+      break;
+    case 'ov': ui.overviewArea = b.dataset.id; ui.scrollToCurrent = true; break;
     case 'toggle':
-      if (area.log[b.dataset.date]) delete area.log[b.dataset.date]; else area.log[b.dataset.date] = 1;
-      save(); break;
+      if (area.types.length === 1) { toggleType(area, b.dataset.date, area.types[0].id); break; }
+      openPicker(area, b.dataset.date);
+      return;
     case 'new': openEditor(fromTemplate(b.dataset.tpl || 'blank'), true); return;
     case 'edit': openEditor(area, false); return;
     case 'export': exportData(); return;
@@ -426,7 +636,6 @@ document.addEventListener('change', (e) => {
   const t = e.target;
   if (t.dataset.note) {
     const a = state.areas.find((x) => x.id === t.dataset.note);
-    a.notes ??= {};
     if (t.value.trim()) a.notes[t.dataset.week] = t.value.trim(); else delete a.notes[t.dataset.week];
     save();
   } else if (t.id === 'import' && t.files[0]) {
@@ -446,8 +655,7 @@ async function importData(file) {
     const data = JSON.parse(await file.text());
     if (!Array.isArray(data.areas) || data.areas.some((a) => !a.id || !a.start || !Array.isArray(a.phases))) throw new Error('bad shape');
     if (state.areas.length && !confirm(`Replace the ${plural(state.areas.length, 'area')} in this browser with the ${data.areas.length} from the file?`)) return;
-    data.areas.forEach((a) => { a.log ??= {}; a.notes ??= {}; });
-    state = { version: 1, areas: data.areas };
+    state = normalize({ areas: data.areas });
     save(); render();
   } catch {
     alert('That file is not a Tracker export.');
